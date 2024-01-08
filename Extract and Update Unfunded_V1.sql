@@ -1,0 +1,104 @@
+-- RUN IN EDW
+--PICK MAX(ID) BEFORE THE LOAD
+SELECT G.ACID, C.CIF_ID, FORACID, ACCT_NAME, --LOWER(custom.fn_get_email_id@FINACLE (foracid)) EMAIL, custom.fn_get_phone_no@FINACLE (foracid) PHONE,
+(select LOWER(NVL(preferredemail, phoneemail.EMAIL)) from crmuser.accounts@FINACLE 
+                                              LEFT JOIN crmuser.phoneemail@finacle ON phoneemail.ORGKEY = accounts.ORGKEY
+                                              where PHONEOREMAIL = 'EMAIL'
+                                              AND PREFERREDFLAG = 'Y'
+                                              AND phoneemail.TMDATE = (SELECT MAX(TMDATE) FROM crmuser.phoneemail@finacle A WHERE A.ORGKEY = phoneemail.ORGKEY
+                                                                       AND PHONEOREMAIL = 'EMAIL'
+                                                                       AND PREFERREDFLAG = 'Y')
+                                              AND accounts.orgkey=C.cif_id) EMAIL,
+                                              (select LOWER(NVL(preferredphone, phoneemail.PHONENO)) from crmuser.accounts@FINACLE 
+                                              LEFT JOIN crmuser.phoneemail@finacle ON phoneemail.ORGKEY = accounts.ORGKEY
+                                              where PHONEOREMAIL = 'PHONE'
+                                              AND PREFERREDFLAG = 'Y'
+                                                                       AND phoneemail.TMDATE = (SELECT MAX(TMDATE) FROM crmuser.phoneemail@finacle A WHERE A.ORGKEY = phoneemail.ORGKEY
+                                                                       AND PHONEOREMAIL = 'PHONE'
+                                                                       AND PREFERREDFLAG = 'Y')
+                                              AND accounts.orgkey=C.cif_id) PHONE_NUMBER,/**/
+ACCT_OPN_DATE, SCHM_CODE, SCHM_TYPE, SCHM_SUB_TYPE,DR_INT_METHOD, CONS_BAL_FLG, LAST_TRAN_DATE, TRUNC(SYSDATE)LOAD_DATE
+FROM TBAADM.GAM@FINACLE G, TBAADM.CMG@FINACLE C, TBAADM.SMT@FINACLE S
+WHERE G.CIF_ID = C.CIF_ID 
+AND G.ACID = S.ACID
+AND G.ACID NOT IN (SELECT ACID FROM TBAADM.HTD@FINACLE WHERE TRAN_DATE >= '01-JAN-2023')
+AND G.LAST_TRAN_DATE IS NULL
+AND G.ENTITY_CRE_FLG = 'Y'
+AND G.ACCT_CLS_FLG = 'N'
+AND G.DEL_FLG = 'N'
+AND G.CUST_ID IS NOT NULL
+AND S.ACCT_STATUS = 'A'
+AND C.SEGMENTATION_CLASS IN ('BL03', 'BL05')
+AND TRUNC(ACCT_OPN_DATE) >= '01-JAN-2023'
+--AND G.ACID = 'IM21785193'
+--AND TO_CHAR(ACCT_OPN_DATE, 'YYYY') >='2021'
+--AND G.SCHM_CODE IN ('CAL01', 'CA02', 'CAL06', 'CAL08', 'CAL10', 'CAL12', 'CAL30', 'CAL31', 'ODF05', 'SBL01', 'SBL02')
+--AND G.SCHM_CODE NOT IN ('CAF19', 'CAL17', 'CAL19', 'CAL20', 'CAL21', 'CAL24', 'CAL25', 'CAL26', 'CAL29', 'ODF09', 'ODL07', 'LAL03', 'LAL07')
+--AND G.SCHM_CODE IN ('CAL01', 'CAL02', 'CAL03', 'CAL04', 'CAL05', 'CAL06', 'CAL07', 'CAL08', 'CAL09', 'CAL10', 'CAL11', 'CAL12', 'CAL30', 'CAL31', 'ODF05', 'SBL01', 'SBL02')
+AND G.SCHM_CODE IN ('CAL30', 'CAL31');
+
+
+
+
+--CHECK FUNDED ACCOUNTS FROM ALL CAMPAIGNS
+-----RUN IN ICUBEPRD DB
+WITH TRX AS
+(
+SELECT ACID, MIN(TRAN_DATE)TRAN_DATE FROM TBAADM.HTD@FIN10
+               WHERE ACID IN (SELECT ACID FROM INTERGRATION.UNFUNDED_LEADS@ICUBEPRD2IL 
+                              WHERE EMAIL_SENT = 1
+                              AND DATE_EMAIL_SENT IS NOT NULL
+                              )
+GROUP BY ACID
+),
+UNFUNDED AS
+(SELECT ACID,  FUNDED,  DATE_EMAIL_SENT, NVL(LEAD( DATE_EMAIL_SENT) OVER (PARTITION BY ACID ORDER BY DATE_EMAIL_SENT), SYSDATE) NEXT_DATE
+FROM  INTERGRATION.UNFUNDED_LEADS@ICUBEPRD2IL
+WHERE FUNDED IS NULL
+)
+SELECT A.ACID, A.TRAN_DATE, CASE WHEN TRAN_DATE IS NOT NULL THEN '1' ELSE '' END FUNDED,
+CASE WHEN A.TRAN_DATE = TRUNC(B.NEXT_DATE) THEN B.NEXT_DATE ELSE B.DATE_EMAIL_SENT END DATE_EMAIL_SENT, 
+B.NEXT_DATE FROM TRX A
+LEFT JOIN UNFUNDED B ON B.ACID = A.ACID
+WHERE A.TRAN_DATE BETWEEN B.DATE_EMAIL_SENT AND NEXT_DATE;
+
+
+---Input date to get for the most recent EMAIL/SMS campaign
+-----Either 
+ SELECT max(TO_DATE(TO_CHAR(date_email_sent, 'DD-MON-RR'))) FROM INTERGRATION.UNFUNDED_LEADS@ICUBEPRD2IL WHERE CAMPAIGN_ID IS NOT NULL;  --For Email
+--OR
+SELECT MAX(TO_DATE(TO_CHAR(date_email_sent, 'DD-MON-RR'))) FROM INTERGRATION.UNFUNDED_LEADS@ICUBEPRD2IL WHERE SMS_CAMPAIGN_ID IS NOT NULL; --For SMS
+
+--TRUNCATE TABLE FUNDED_LEADS@ICUBEPRD2IL
+---IMPORT DATA INTO FUNDED_LEADS@ICUBEPRD2IL
+----UPDATE COLUMN FUNDED_LEADS@ICUBEPRD2IL.FUNDED = 1 WHERE TRAN_DATE IS NOT NULL
+-----CONFIRM THE ENTRIES USING
+SELECT * FROM FUNDED_LEADS A--2743
+LEFT JOIN UNFUNDED_LEADS B ON B.ACID = A.ACID AND B.DATE_EMAIL_SENT = A.DATE_EMAIL_SENT;
+
+
+
+--UPDATE THE FUNDED AND FUNDED_UPDATE_DATE
+------RUN IN INTEGRATION DB
+UPDATE UNFUNDED_LEADS A
+SET (A.FUNDED_UPDATE_DATE, 
+     A.FUNDED) = (SELECT B.TRAN_DATE, B.FUNDED FROM FUNDED_LEADS B
+                  WHERE B.ACID = A.ACID AND B.DATE_EMAIL_SENT = A.DATE_EMAIL_SENT
+              )
+WHERE ACID IN (SELECT ACID FROM FUNDED_LEADS);
+         
+COMMIT;
+
+
+--UPDATE MULTIPLES WITH 0
+------RUN IN INTEGRATION DB
+UPDATE UNFUNDED_LEADS
+SET FUNDED = 0
+WHERE ACID IN (SELECT ACID FROM UNFUNDED_LEADS A
+             WHERE FUNDED IS NULL
+             AND DATE_EMAIL_SENT IS NOT NULL
+             AND ACID IN (SELECT ACID FROM UNFUNDED_LEADS B WHERE ACID = B.ACID AND FUNDED IS NOT NULL)
+             )
+AND FUNDED IS NULL;
+
+COMMIT;
